@@ -146,6 +146,31 @@ def test_every_string_in_the_schema_language_parses_and_validates():
     assert parsed >= 10
 
 
+def test_whitespace_grammar_accepts_compact_and_pretty_json():
+    compact = compile_regex(S.to_regex(PERSON))
+    loose = compile_regex(S.to_regex(PERSON, ws=S.WS))
+    vals = [
+        {"name": "Ann", "age": 31, "active": True},
+        {"name": "", "age": 7, "tags": ["a", "c"], "score": -1.5e3, "active": True},
+        {"name": "Zoë", "age": 12, "tags": [], "active": False},
+    ]
+    for v in vals:
+        pretty = json.dumps(v, ensure_ascii=False, indent=2).encode()
+        assert loose.fullmatch(S.dumps(v).encode()) and loose.fullmatch(pretty), v
+        assert not compact.fullmatch(pretty), v
+    # whitespace is only allowed between tokens, never inside a literal or a key
+    assert not loose.fullmatch(b'{"name":"A","age":3 1,"active":true}')
+    assert not loose.fullmatch(b'{"na me":"A","age":1,"active":true}')
+    assert not loose.fullmatch(b'{"name":"A","age":1,"active":tr ue}')
+    rng = random.Random(3)
+    for bs in sample_accepted(loose, rng, n=60, max_len=400):
+        try:
+            v = json.loads(bs.decode("utf-8"))
+        except UnicodeDecodeError:
+            continue
+        assert S.validate(v, PERSON), bs
+
+
 @pytest.mark.parametrize(
     "schema",
     [
