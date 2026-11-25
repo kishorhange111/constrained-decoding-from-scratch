@@ -10,8 +10,9 @@ with no host–device traffic during decoding.
 There are two builders, which give identical tables:
 - **trie**: the vocabulary is arranged into a byte trie. Each state walks it depth-first,
   abandoning a subtree the moment the DFA dies, and tokens sharing a prefix share work. The
-  cost is pure Python per trie node visited, which is slow when a state allows almost every
-  token (inside a JSON string).
+  cost is pure Python per trie node visited, which grows when a state allows almost every
+  token (inside a JSON string). On Qwen's vocabulary it was still within about 1.3× of the
+  vectorized builder.
 - **vectorized**: all (state, token) pairs advance together, one byte position at a time,
   with NumPy fancy indexing into the transition table (plus an absorbing dead row). The
   cost is ``states × vocab × max token length`` simple integer ops, with no Python per token.

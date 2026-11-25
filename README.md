@@ -74,4 +74,51 @@ pytest -q                            # 29 tests, CPU
 python -m cdec.bench --out results   # Qwen2.5-0.5B-Instruct: free vs constrained, index stats
 ```
 
-**Results are pending** from the Colab run.
+## Results (Tesla T4, Colab)
+
+Qwen2.5-0.5B-Instruct, greedy, 24 prompts per schema, ≤ 256 new tokens. The output is in
+[`results/bench.md`](results/bench.md), and [`results/bench.json`](results/bench.json)
+includes an example output per schema and mode.
+
+| schema | mode | parses | satisfies schema | degenerate strings | right tool | mean tokens | ms/token | DFA states |
+|---|---|---|---|---|---|---|---|---|
+| person | free | 100% | 100% | 3/142 | – | 56 | 29.1 | – |
+| person | compact | 100% | 100% | **76/157** | – | 32 | 29.0 | 161 |
+| person | ws | 100% | 100% | 3/136 | – | 51 | 29.4 | 161 |
+| order | free | 100% | 100% | 0/114 | – | 151 | 28.0 | – |
+| order | compact | 100% | 100% | 0/120 | – | 92 | 27.5 | 259 |
+| order | ws | 100% | 100% | 0/115 | – | 150 | 27.8 | 263 |
+| tool_call | free | 100% | 100% | 0/72 | 100% | 49 | 27.8 | – |
+| tool_call | compact | 100% | 100% | 6/72 | **75%** | 33 | 27.5 | 125 |
+| tool_call | ws | 100% | 100% | 0/72 | 100% | 49 | 27.9 | 126 |
+
+"Degenerate" means a string value that is empty or a single character. The date in every
+tool call was right in all three modes.
+
+**A grammar that guarantees validity can still damage the content.** On these schemas and
+prompts, the 0.5B model already produced valid JSON 100% of the time without any
+constraint, so the constraint had nothing to fix. Restricting it to *compact* JSON then made
+things worse:
+- On `person`, **48% of string values became degenerate** (76 of 157, against 3 of 142
+  free). A typical output was `{"name":".","age":0,"email":"",…}`.
+- On `tool_call`, it picked the right tool only **75%** of the time, against 100% free.
+  For example, it called `convert_currency` for a Paris weather request.
+
+The model writes JSON in the indented form it was trained on. The compact grammar masks
+every newline and space, which pushes it onto token sequences it rarely saw, and the
+content drifts.
+
+**Allowing whitespace between tokens (`ws`) removes the damage.** Degenerate strings drop
+to 3 of 136 and tool choice returns to 100%. For each schema, the saved example (the first prompt)
+is character-for-character the free model's own answer, minus the ```` ```json ```` fence. The
+fix costs at most 4 DFA states (259 → 263) and no measurable time per token.
+
+Other measurements:
+- **Masking is free at this scale.** Time per token is 27.5–29.4 ms in every mode. The
+  mask is one row of a cached boolean matrix on the GPU.
+- **Index build** takes 1.5–3.8 s per schema over 151,665 tokens. The pure-Python trie walk
+  took 2.0 s against the vectorized builder's 1.5 s for `tool_call`, so the two are
+  comparable on these schemas.
+- **`maxLength` multiplies states.** One string with `maxLength = k` goes from 15 states
+  (unbounded) to 835 at k = 64, and the index table from 4 MiB to 242 MiB. Bounded
+  repetition is the expensive part of a JSON-schema grammar.
