@@ -3,11 +3,18 @@
     python -m cdec.bench --out results [--model Qwen/Qwen2.5-0.5B-Instruct]
 
 There are three schemas (a flat record, nested arrays of objects, a tool call) and 24 chat
-prompts each, with greedy decoding of up to 256 tokens. For the unconstrained output, a
-fenced ```json block is extracted if there is one, then the run counts how often the text
-parses and how often it satisfies the schema (key order ignored, to be fair). For the
-constrained output, the run reports the same, plus the index statistics (DFA states, index
-entries, build time) and the cost per token of masking.
+prompts each, with greedy decoding of up to 256 tokens, in three modes:
+- ``free``: unconstrained. A fenced ```json block is extracted if there is one.
+- ``compact``: constrained to compact JSON, with no whitespace anywhere.
+- ``ws``: constrained, with JSON whitespace (``[ \\n]*``) allowed between tokens, so the model
+  can keep the indented layout it was trained on.
+
+Validity alone is not the whole story: a grammar can force an output that parses but says
+nothing. So the run also measures content. For ``tool_call`` it checks that the tool is the
+right one for the request and that the date matches the one in the prompt. For every schema
+it counts degenerate string values (empty, or a single character) and runs cut off at the
+token limit. It also reports index statistics (DFA states, index entries, build time) and
+the cost per token of masking.
 """
 
 from __future__ import annotations
@@ -115,6 +122,20 @@ SUBJECTS = {
 }
 
 
+# The right tool for each tool_call subject above.
+EXPECTED_TOOL = [
+    "get_weather",
+    "search_flights",
+    "convert_currency",
+    "get_weather",
+    "search_flights",
+    "convert_currency",
+    "get_weather",
+    "search_flights",
+]
+MODES = {"free": None, "compact": "", "ws": S.WS}
+
+
 def prompts(name: str, n: int) -> list[str]:
     sch = json.dumps(SCHEMAS[name])
     subj = SUBJECTS[name]
@@ -134,12 +155,48 @@ def extract(text: str) -> str:
     return (m.group(1) if m else text).strip()
 
 
-def check(text: str, schema: dict) -> tuple[bool, bool]:
+def parse(text: str):
     try:
-        v = json.loads(extract(text))
+        return json.loads(extract(text))
     except (json.JSONDecodeError, ValueError):
-        return False, False
-    return True, S.validate(v, schema, ordered=False)
+        return None
+
+
+def strings(v):
+    if isinstance(v, str):
+        yield v
+    elif isinstance(v, dict):
+        for x in v.values():
+            yield from strings(x)
+    elif isinstance(v, list):
+        for x in v:
+            yield from strings(x)
+
+
+def content(name: str, i: int, v) -> dict:
+    """Content checks on a parsed output ``v`` for prompt ``i``."""
+    ss = list(strings(v)) if v is not None else []
+    out = {"degenerate": sum(len(x.strip()) <= 1 for x in ss), "n_strings": len(ss)}
+    if name == "tool_call":
+        subj = SUBJECTS[name][i % len(SUBJECTS[name])]
+        out["tool_ok"] = isinstance(v, dict) and v.get("tool") == EXPECTED_TOOL[i % 8]
+        m = re.search(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", subj)
+        if m:
+            args = v.get("arguments") if isinstance(v, dict) else None
+            out["date_ok"] = isinstance(args, dict) and args.get("date") == m.group(0)
+    return out
+
+
+def _mean(xs):
+    return sum(xs) / len(xs) if xs else None
+
+
+def _pct(x):
+    return "–" if x is None else f"{x:.0%}"
+
+
+def _fmt(x, spec=""):
+    return "–" if x is None else format(x, spec)
 
 
 def main(argv=None):
@@ -161,17 +218,21 @@ def main(argv=None):
     vocab_s = time.perf_counter() - t0
     rows, examples = [], {}
     for name, sch in SCHEMAS.items():
-        t0 = time.perf_counter()
-        dfa = compile_regex(S.to_regex(sch))
-        compile_s = time.perf_counter() - t0
-        index = TokenIndex.build(dfa, vocab, eos_id=eos)
-        trie_s = None
-        if name == "tool_call":  # the pure-Python trie builder, timed once for comparison
-            trie = TokenIndex.build(dfa, vocab, eos_id=eos, method="trie")
-            assert (trie.table == index.table).all()
-            trie_s = trie.build_seconds
-        for mode in ("free", "constrained"):
-            ok_parse = ok_schema = n_tok = 0
+        for mode, ws in MODES.items():
+            dfa = index = None
+            compile_s = trie_s = None
+            if ws is not None:
+                t0 = time.perf_counter()
+                dfa = compile_regex(S.to_regex(sch, ws=ws))
+                compile_s = time.perf_counter() - t0
+                index = TokenIndex.build(dfa, vocab, eos_id=eos)
+                if name == "tool_call" and mode == "compact":  # pure-Python trie, timed once
+                    trie = TokenIndex.build(dfa, vocab, eos_id=eos, method="trie")
+                    assert (trie.table == index.table).all()
+                    trie_s = trie.build_seconds
+                    del trie
+            ok_parse = ok_schema = n_tok = hit_max = 0
+            agg = {"degenerate": 0, "n_strings": 0, "tool_ok": [], "date_ok": []}
             gen_s = 0.0
             for i, p in enumerate(prompts(name, a.n)):
                 msgs = [{"role": "user", "content": p}]
@@ -179,14 +240,21 @@ def main(argv=None):
                 ids = (ids if torch.is_tensor(ids) else ids["input_ids"]).to(dev)
                 torch.cuda.synchronize() if dev == "cuda" else None
                 t1 = time.perf_counter()
-                out = generate(model, ids, index if mode == "constrained" else None, a.max_new, eos)
+                out = generate(model, ids, index, a.max_new, eos)
                 torch.cuda.synchronize() if dev == "cuda" else None
                 gen_s += time.perf_counter() - t1
                 text = tok.decode(out)
-                pp, ss = check(text, sch)
-                ok_parse += pp
-                ok_schema += ss
+                v = parse(text)
+                ok_parse += v is not None
+                ok_schema += v is not None and S.validate(v, sch, ordered=False)
                 n_tok += len(out)
+                hit_max += len(out) >= a.max_new
+                c = content(name, i, v)
+                agg["degenerate"] += c["degenerate"]
+                agg["n_strings"] += c["n_strings"]
+                for k in ("tool_ok", "date_ok"):
+                    if k in c:
+                        agg[k].append(c[k])
                 if i == 0:
                     examples[f"{name}/{mode}"] = text
             row = {
@@ -196,29 +264,36 @@ def main(argv=None):
                 "schema_valid_rate": ok_schema / a.n,
                 "mean_tokens": n_tok / a.n,
                 "ms_per_token": gen_s / max(n_tok, 1) * 1e3,
-                "dfa_states": dfa.n_states,
+                "hit_max_new": hit_max / a.n,
+                "degenerate_strings": agg["degenerate"],
+                "n_strings": agg["n_strings"],
+                "tool_acc": _mean(agg["tool_ok"]),
+                "date_acc": _mean(agg["date_ok"]),
+                "dfa_states": dfa.n_states if dfa else None,
                 "compile_s": compile_s,
-                "index_build_s": index.build_seconds,
-                "index_entries": index.n_entries,
+                "index_build_s": index.build_seconds if index else None,
+                "index_entries": index.n_entries if index else None,
                 "trie_build_s": trie_s,
             }
             rows.append(row)
             print(json.dumps(row), flush=True)
+            del index
     dev_name = torch.cuda.get_device_name() if dev == "cuda" else "cpu"
     lines = [
         f"{a.model} on **{dev_name}**, greedy, ≤ {a.max_new} new tokens, {a.n} prompts per schema."
         f" Vocabulary: {len(vocab):,} tokens (bytes extracted in {vocab_s:.1f} s).",
         "",
-        "| schema | mode | parses | satisfies schema | mean tokens | ms/token |"
-        " DFA states | index build (s) | index entries |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| schema | mode | parses | satisfies schema | degenerate strings | right tool |"
+        " right date | hit token limit | mean tokens | ms/token | DFA states | index build (s) |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         lines.append(
             f"| {r['schema']} | {r['mode']} | {r['parse_rate']:.0%} |"
-            f" {r['schema_valid_rate']:.0%} |"
-            f" {r['mean_tokens']:.0f} | {r['ms_per_token']:.1f} | {r['dfa_states']} |"
-            f" {r['index_build_s']:.1f} | {r['index_entries']:,} |"
+            f" {r['schema_valid_rate']:.0%} | {r['degenerate_strings']}/{r['n_strings']} |"
+            f" {_pct(r['tool_acc'])} | {_pct(r['date_acc'])} | {r['hit_max_new']:.0%} |"
+            f" {r['mean_tokens']:.0f} | {r['ms_per_token']:.1f} | {_fmt(r['dfa_states'])} |"
+            f" {_fmt(r['index_build_s'], '.1f')} |"
         )
     tr = next(r for r in rows if r["trie_build_s"] is not None)
     lines += [

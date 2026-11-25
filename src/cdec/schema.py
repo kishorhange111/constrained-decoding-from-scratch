@@ -1,4 +1,8 @@
-"""A subset of JSON Schema compiled to a regex over compact JSON (``separators=(",", ":")``).
+"""A subset of JSON Schema compiled to a regex over JSON text.
+
+By default the regex describes compact JSON (``separators=(",", ":")``). With ``ws`` set
+(for example ``WS``, spaces and newlines), that pattern may appear around every ``{ } [ ] , :``,
+so the model can also write the pretty-printed layout it saw in training.
 
 Supported:
 - ``type``: ``string`` (with ``minLength``/``maxLength`` and ``pattern`` as a raw sub-regex),
@@ -40,7 +44,11 @@ def _lit(value) -> str:
     return _escape(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 
 
-def to_regex(schema: dict) -> str:
+WS = r"[ \n]*"  # JSON whitespace (spaces and newlines) between structural characters
+
+
+def to_regex(schema: dict, ws: str = "") -> str:
+    """Regex for ``schema``; ``ws`` is the whitespace pattern allowed between tokens."""
     if "const" in schema:
         return _lit(schema["const"])
     if "enum" in schema:
@@ -61,32 +69,35 @@ def to_regex(schema: dict) -> str:
     if t == "null":
         return "null"
     if t == "array":
-        item = to_regex(schema.get("items", {"type": "string"}))
+        item = to_regex(schema.get("items", {"type": "string"}), ws)
         lo, hi = schema.get("minItems", 0), schema.get("maxItems")
         if hi == 0:
-            return r"\[\]"
+            return rf"\[{ws}\]"
         rest_lo = max(lo - 1, 0)
         rest_hi = "" if hi is None else str(hi - 1)
-        body = f"{item}(?:,{item}){{{rest_lo},{rest_hi}}}"
-        return rf"\[{body}\]" if lo >= 1 else rf"\[(?:{body})?\]"
+        body = f"{item}(?:{ws},{ws}{item}){{{rest_lo},{rest_hi}}}"
+        if lo >= 1:
+            return rf"\[{ws}{body}{ws}\]"
+        return rf"\[{ws}(?:{body}{ws})?\]"
     if t == "object":
-        return _object(schema)
+        return _object(schema, ws)
     raise ValueError(f"unsupported schema: {schema}")
 
 
-def _object(schema: dict) -> str:
+def _object(schema: dict, ws: str = "") -> str:
     props = schema.get("properties", {})
     required = set(schema.get("required", list(props)))
-    parts = [(_lit(k) + ":" + to_regex(s), k in required) for k, s in props.items()]
+    parts = [(_lit(k) + f"{ws}:{ws}" + to_regex(s, ws), k in required) for k, s in props.items()]
     if not parts:
-        return r"\{\}"
+        return rf"\{{{ws}\}}"
     # Build "first present member, then ',member' for each later one", with optional members.
     # States: whether something has been emitted yet. Enumerate prefixes left to right.
     # regex for members i.. given that a member was already emitted (needs a leading comma):
     tail = [""] * (len(parts) + 1)
     for i in range(len(parts) - 1, -1, -1):
         m, req = parts[i]
-        tail[i] = f",{m}{tail[i + 1]}" if req else f"(?:,{m})?{tail[i + 1]}"
+        c = f"{ws},{ws}"
+        tail[i] = f"{c}{m}{tail[i + 1]}" if req else f"(?:{c}{m})?{tail[i + 1]}"
     # regex for members i.. when nothing has been emitted yet:
     head = [""] * (len(parts) + 1)
     for i in range(len(parts) - 1, -1, -1):
@@ -95,7 +106,7 @@ def _object(schema: dict) -> str:
             head[i] = f"{m}{tail[i + 1]}"
         else:
             head[i] = f"(?:{m}{tail[i + 1]}|{head[i + 1]})" if head[i + 1] else f"(?:{m})?"
-    return r"\{" + head[0] + r"\}"
+    return r"\{" + ws + head[0] + ws + r"\}"
 
 
 def dumps(value) -> str:
